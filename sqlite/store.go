@@ -186,12 +186,11 @@ func (s *Store) SaveRun(ctx context.Context, run aurora.StoredRun) error {
 	}
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO runs (
-	tenant_id,id,thread_id,revision,depth,message,status,attempt,created_at,updated_at,
+	tenant_id,id,thread_id,revision,message,status,attempt,created_at,updated_at,
 	started_at,completed_at,answer,error_text,effective_manifest,brain_digest
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(tenant_id,id) DO UPDATE SET
 	revision=excluded.revision,
-	depth=excluded.depth,
 	status=excluded.status,
 	attempt=excluded.attempt,
 	updated_at=excluded.updated_at,
@@ -201,7 +200,7 @@ ON CONFLICT(tenant_id,id) DO UPDATE SET
 	error_text=excluded.error_text,
 	effective_manifest=excluded.effective_manifest,
 	brain_digest=excluded.brain_digest`,
-		run.TenantID, run.ID, run.ThreadID, run.Revision, run.Depth, run.Message, run.Status,
+		run.TenantID, run.ID, run.ThreadID, run.Revision, run.Message, run.Status,
 		run.Attempt, formatTime(run.CreatedAt), formatTime(run.UpdatedAt),
 		nullableTime(run.StartedAt), nullableTime(run.CompletedAt), run.Answer,
 		run.Error, manifest, run.BrainDigest)
@@ -421,7 +420,7 @@ FROM threads WHERE tenant_id=? ORDER BY created_at`, tenantID)
 
 func (s *Store) loadRuns(ctx context.Context, tenantID string) ([]aurora.StoredRun, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id,thread_id,revision,depth,message,status,attempt,created_at,updated_at,
+SELECT id,thread_id,revision,message,status,attempt,created_at,updated_at,
 	started_at,completed_at,answer,error_text,effective_manifest,brain_digest
 FROM runs WHERE tenant_id=? ORDER BY created_at`, tenantID)
 	if err != nil {
@@ -436,7 +435,7 @@ FROM runs WHERE tenant_id=? ORDER BY created_at`, tenantID)
 		var manifest []byte
 		run.TenantID = tenantID
 		if err := rows.Scan(
-			&run.ID, &run.ThreadID, &run.Revision, &run.Depth, &run.Message, &run.Status,
+			&run.ID, &run.ThreadID, &run.Revision, &run.Message, &run.Status,
 			&run.Attempt, &created, &updated, &started, &completed, &run.Answer,
 			&run.Error, &manifest, &run.BrainDigest,
 		); err != nil {
