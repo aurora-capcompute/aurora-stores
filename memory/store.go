@@ -105,10 +105,24 @@ func (s *Store) OpenJournal(_ context.Context, scope aurora.RunContext) (journal
 	return journal, nil
 }
 
-func (s *Store) ResetJournal(_ context.Context, scope aurora.RunContext) error {
+// ForkJournal mints a new revision (child) that shares the parent revision's
+// recorded prefix [0, offset) copy-on-write: reads below the offset fall through
+// to the parent journal, while new records are appended to the child's own tail.
+// The parent revision is left untouched and remains addressable.
+func (s *Store) ForkJournal(_ context.Context, parent, child aurora.RunContext, offset int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.journals[scope.SessionKey()] = &storeJournal{}
+	if parent.TenantID != child.TenantID || parent.RunID != child.RunID {
+		return errors.New("fork journal: parent and child must share tenant and run")
+	}
+	if offset < 0 {
+		return errors.New("fork journal: negative offset")
+	}
+	parentJournal := s.journals[parent.SessionKey()]
+	if offset > 0 && parentJournal == nil {
+		return errors.New("fork journal: parent revision has no journal")
+	}
+	s.journals[child.SessionKey()] = &storeJournal{parent: parentJournal, offset: offset}
 	return nil
 }
 
@@ -232,22 +246,34 @@ func (s *Store) MarkExecuted(_ context.Context, tenantID, taskID string, _ time.
 type storeJournal struct {
 	mu      sync.Mutex
 	records []journaled.Record
+	// parent and offset implement copy-on-write revisions: positions below
+	// offset are read from the parent journal, while this journal owns the tail
+	// at positions [offset, offset+len(records)).
+	parent *storeJournal
+	offset int
 }
 
 func (j *storeJournal) Load(index int) (journaled.Record, error) {
 	j.mu.Lock()
+	parent := j.parent
+	offset := j.offset
+	if parent != nil && index < offset {
+		j.mu.Unlock()
+		return parent.Load(index)
+	}
 	defer j.mu.Unlock()
-	if index < 0 || index >= len(j.records) {
+	local := index - offset
+	if local < 0 || local >= len(j.records) {
 		return journaled.Record{}, errors.New("journal record not found")
 	}
-	record := j.records[index]
+	record := j.records[local]
 	return journaled.Record{Call: record.Call.Copy(), Outcome: record.Outcome.Copy()}, nil
 }
 
 func (j *storeJournal) Store(index int, call dispatcher.Call, outcome dispatcher.Outcome) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if index != len(j.records) {
+	if index != j.offset+len(j.records) {
 		return errors.New("invalid journal index")
 	}
 	j.records = append(j.records, journaled.Record{Call: call.Copy(), Outcome: outcome.Copy()})
@@ -257,7 +283,7 @@ func (j *storeJournal) Store(index int, call dispatcher.Call, outcome dispatcher
 func (j *storeJournal) Length() int {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	return len(j.records)
+	return j.offset + len(j.records)
 }
 
 func storeKey(a, b string) string {

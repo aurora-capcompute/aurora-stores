@@ -94,6 +94,14 @@ CREATE TABLE IF NOT EXISTS journal_records (
 	outcome_message TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (tenant_id, run_id, revision, position)
 );
+CREATE TABLE IF NOT EXISTS journal_forks (
+	tenant_id TEXT NOT NULL,
+	run_id TEXT NOT NULL,
+	revision INTEGER NOT NULL,
+	parent_revision INTEGER NOT NULL,
+	fork_offset INTEGER NOT NULL,
+	PRIMARY KEY (tenant_id, run_id, revision)
+);
 CREATE TABLE IF NOT EXISTS tasks (
 	tenant_id TEXT NOT NULL,
 	id TEXT NOT NULL,
@@ -234,10 +242,21 @@ func (s *Store) OpenJournal(_ context.Context, scope aurora.RunContext) (journal
 	return &journal{db: s.db, scope: scope}, nil
 }
 
-func (s *Store) ResetJournal(ctx context.Context, scope aurora.RunContext) error {
+// ForkJournal mints a new revision (child) that shares the parent revision's
+// recorded prefix [0, offset) copy-on-write: reads below the offset fall through
+// to the parent chain, while new records are appended to the child's own tail.
+// The parent revision is left untouched and remains addressable.
+func (s *Store) ForkJournal(ctx context.Context, parent, child aurora.RunContext, offset int) error {
+	if parent.TenantID != child.TenantID || parent.RunID != child.RunID {
+		return fmt.Errorf("fork journal: parent and child must share tenant and run")
+	}
+	if offset < 0 {
+		return fmt.Errorf("fork journal: negative offset %d", offset)
+	}
 	_, err := s.db.ExecContext(ctx,
-		`DELETE FROM journal_records WHERE tenant_id=? AND run_id=? AND revision=?`,
-		scope.TenantID, scope.RunID, scope.Revision)
+		`INSERT OR REPLACE INTO journal_forks (tenant_id,run_id,revision,parent_revision,fork_offset)
+		VALUES (?,?,?,?,?)`,
+		child.TenantID, child.RunID, child.Revision, parent.Revision, offset)
 	return err
 }
 
@@ -485,16 +504,44 @@ type journal struct {
 	scope aurora.RunContext
 }
 
+// forkInfo reports the parent revision and fork offset for a revision, or
+// forked=false when the revision is independent (no shared prefix).
+func (j *journal) forkInfo(revision uint64) (parentRevision uint64, offset int, forked bool, err error) {
+	err = j.db.QueryRow(
+		`SELECT parent_revision, fork_offset FROM journal_forks WHERE tenant_id=? AND run_id=? AND revision=?`,
+		j.scope.TenantID, j.scope.RunID, revision).Scan(&parentRevision, &offset)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, 0, false, nil
+	}
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return parentRevision, offset, true, nil
+}
+
 func (j *journal) Load(position int) (journaled.Record, error) {
+	return j.loadAt(j.scope.Revision, position)
+}
+
+// loadAt resolves a position within a revision, falling through to the parent
+// chain for positions below the fork offset (copy-on-write read).
+func (j *journal) loadAt(revision uint64, position int) (journaled.Record, error) {
+	parentRevision, offset, forked, err := j.forkInfo(revision)
+	if err != nil {
+		return journaled.Record{}, err
+	}
+	if forked && position < offset {
+		return j.loadAt(parentRevision, position)
+	}
 	var call dispatcher.Call
 	var kind dispatcher.OutcomeKind
 	var result []byte
 	var message string
-	err := j.db.QueryRow(`
+	err = j.db.QueryRow(`
 SELECT call_name,call_args,outcome_kind,outcome_result,outcome_message
 FROM journal_records
 WHERE tenant_id=? AND run_id=? AND revision=? AND position=?`,
-		j.scope.TenantID, j.scope.RunID, j.scope.Revision, position).
+		j.scope.TenantID, j.scope.RunID, revision, position).
 		Scan(&call.Name, &call.Args, &kind, &result, &message)
 	if errors.Is(err, sql.ErrNoRows) {
 		return journaled.Record{}, errors.New("journal record not found")
@@ -526,13 +573,20 @@ INSERT INTO journal_records (
 }
 
 func (j *journal) Length() int {
-	var length int
-	if err := j.db.QueryRow(`
-SELECT COUNT(*) FROM journal_records WHERE tenant_id=? AND run_id=? AND revision=?`,
-		j.scope.TenantID, j.scope.RunID, j.scope.Revision).Scan(&length); err != nil {
+	_, offset, forked, err := j.forkInfo(j.scope.Revision)
+	if err != nil {
 		return 0
 	}
-	return length
+	var own int
+	if err := j.db.QueryRow(`
+SELECT COUNT(*) FROM journal_records WHERE tenant_id=? AND run_id=? AND revision=?`,
+		j.scope.TenantID, j.scope.RunID, j.scope.Revision).Scan(&own); err != nil {
+		return 0
+	}
+	if forked {
+		return offset + own
+	}
+	return own
 }
 
 const taskSelect = `
